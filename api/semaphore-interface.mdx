@@ -1,0 +1,107 @@
+---
+title: "Semaphore interface"
+description: "The core interface type that all sema semaphores implement."
+---
+
+The `Semaphore` interface is the public contract exposed by the `sema` package. All interaction with a semaphore goes through this interface — the concrete `semaphore` struct that backs it is unexported.
+
+```go
+// Semaphore defines the interface for a semaphore that controls concurrent access.
+// It provides methods to acquire and release slots, check the current usage,
+// and determine if the semaphore is empty.
+type Semaphore interface {
+    Acquire()
+    Release()
+    Len() int
+    IsEmpty() bool
+}
+```
+
+## Why an interface?
+
+Exposing `Semaphore` as an interface rather than a concrete type gives you:
+
+- **Testability** — you can swap in a mock or no-op implementation in tests without touching production logic.
+- **Decoupling** — code that accepts a `Semaphore` parameter is not tied to any particular internal representation.
+- **Extensibility** — you can wrap or decorate the interface without forking the package.
+
+`sema.New()` returns a `Semaphore` value. You never hold a reference to the underlying `*semaphore` struct.
+
+## Methods
+
+<ParamField path="Acquire" type="func()">
+  Blocks until a concurrency slot is available, then occupies one slot. Call
+  this immediately before starting a goroutine or entering a rate-limited
+  section. Internally, it sends `struct{}{}` to a buffered channel, blocking
+  when the channel is full.
+</ParamField>
+
+<ParamField path="Release" type="func()">
+  Frees a previously acquired slot, unblocking any goroutine that is waiting
+  inside `Acquire`. Call this when the concurrent task is complete — typically
+  via `defer`. Internally, it receives from the buffered channel.
+</ParamField>
+
+<ParamField path="Len" type="func() int">
+  Returns the number of slots currently occupied. Each occupied slot
+  corresponds to one goroutine (or task) that has called `Acquire` but not yet
+  called `Release`. Internally delegates to `len(s.semC)`.
+</ParamField>
+
+<ParamField path="IsEmpty" type="func() bool">
+  Returns `true` when no slots are occupied (`Len() == 0`). Useful for
+  asserting that all work has finished before proceeding.
+</ParamField>
+
+## Usage example
+
+The example below shows a worker pool pattern. Up to `maxConcurrency` goroutines run at the same time; the semaphore blocks additional launches until a slot is freed.
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+
+    "github.com/andreimerlescu/sema"
+)
+
+func main() {
+    const maxConcurrency = 5
+    sem := sema.New(maxConcurrency) // returns a Semaphore interface value
+
+    var wg sync.WaitGroup
+    for i := 0; i < 20; i++ {
+        wg.Add(1)
+        sem.Acquire() // blocks when 5 goroutines are already running
+        go func(id int) {
+            defer wg.Done()
+            defer sem.Release() // frees the slot when this goroutine exits
+            fmt.Printf("worker %d running (%d active)\n", id, sem.Len())
+        }(i)
+    }
+    wg.Wait()
+    fmt.Println("all done, semaphore empty:", sem.IsEmpty())
+}
+```
+
+<Note>
+  `sema.New()` is the only way to obtain a `Semaphore`. You do not need to
+  construct or reference the underlying struct directly.
+</Note>
+
+## Implementing the interface yourself
+
+If you need a mock for testing, implement the four methods on any type:
+
+```go
+type noopSemaphore struct{}
+
+func (noopSemaphore) Acquire()    {}
+func (noopSemaphore) Release()    {}
+func (noopSemaphore) Len() int    { return 0 }
+func (noopSemaphore) IsEmpty() bool { return true }
+```
+
+Pass a `noopSemaphore{}` wherever a `sema.Semaphore` is expected to disable concurrency limiting in tests.

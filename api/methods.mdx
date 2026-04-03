@@ -1,0 +1,206 @@
+---
+title: "Methods"
+description: "Reference for the four methods on the Semaphore interface: Acquire, Release, Len, and IsEmpty."
+---
+
+All four methods are defined on the `Semaphore` interface and implemented by the unexported `*semaphore` struct returned by `sema.New()`.
+
+---
+
+## Acquire
+
+```go
+func (s *semaphore) Acquire()
+```
+
+Blocks the calling goroutine until a concurrency slot is available, then occupies one slot.
+
+**Internal behaviour:** sends `struct{}{}` to the buffered channel (`s.semC <- struct{}{}`). When the channel is at capacity — meaning `maxConcurrency` goroutines already hold slots — this send blocks until another goroutine calls `Release`.
+
+**When to call:** immediately before launching or entering a concurrent task. Do not call `Acquire` inside the goroutine itself if you need the throttling to take effect before the goroutine starts.
+
+<Note>
+  Calling `Acquire` outside the goroutine (before `go func()`) ensures the
+  scheduler does not spawn more goroutines than the semaphore allows.
+</Note>
+
+### Example
+
+```go
+const workers = 5
+sem := sema.New(workers)
+var wg sync.WaitGroup
+
+for i := 0; i < 20; i++ {
+    wg.Add(1)
+    sem.Acquire() // blocks here when 5 goroutines are active
+    go func(id int) {
+        defer wg.Done()
+        defer sem.Release()
+        doWork(id)
+    }(i)
+}
+wg.Wait()
+```
+
+---
+
+## Release
+
+```go
+func (s *semaphore) Release()
+```
+
+Frees one slot in the semaphore, allowing any goroutine blocked inside `Acquire` to proceed.
+
+**Internal behaviour:** receives from the buffered channel (`<-s.semC`), removing one occupied slot.
+
+**When to call:** when a concurrent task completes. Using `defer sem.Release()` at the top of a goroutine guarantees the slot is freed even if the goroutine panics or returns early.
+
+<Warning>
+  Calling `Release` more times than `Acquire` will receive from an empty
+  channel, causing the goroutine to block indefinitely. Always pair each
+  `Acquire` with exactly one `Release`.
+</Warning>
+
+### Example
+
+```go
+sem := sema.New(3)
+
+sem.Acquire()
+go func() {
+    defer sem.Release() // always runs, even on early return
+    processItem()
+}()
+```
+
+---
+
+## Len
+
+```go
+func (s *semaphore) Len() int
+```
+
+Returns the number of slots currently occupied — that is, the number of goroutines (or tasks) that have called `Acquire` and have not yet called `Release`.
+
+**Internal behaviour:** returns `len(s.semC)`, the number of items buffered in the channel.
+
+**Return value:**
+
+<ResponseField name="int" type="int">
+  An integer in the range `[0, maxConcurrency]`. A value of `0` means no
+  goroutines currently hold a slot. A value equal to `maxConcurrency` means
+  the semaphore is at full capacity and the next `Acquire` will block.
+</ResponseField>
+
+### Example
+
+```go
+sem := sema.New(3)
+
+sem.Acquire()
+sem.Acquire()
+fmt.Println(sem.Len()) // 2
+
+sem.Release()
+fmt.Println(sem.Len()) // 1
+```
+
+The test suite verifies this directly:
+
+```go
+// from sema_test.go — TestBakersDozen
+for i := 0; i < tt.args.maxConcurrency; i++ {
+    got.Acquire()
+    if gotLen := got.Len(); gotLen != i+1 {
+        t.Errorf("got.Len() = %d, want %d", gotLen, i+1)
+    }
+}
+```
+
+---
+
+## IsEmpty
+
+```go
+func (s *semaphore) IsEmpty() bool
+```
+
+Reports whether the semaphore has no occupied slots.
+
+**Internal behaviour:** delegates to `s.Len() == 0`.
+
+**Return value:**
+
+<ResponseField name="bool" type="bool">
+  `true` when no goroutines currently hold a slot; `false` otherwise.
+</ResponseField>
+
+<Tip>
+  Use `IsEmpty` after a `sync.WaitGroup` wait to assert that all slots were
+  properly released before continuing.
+</Tip>
+
+### Example
+
+```go
+sem := sema.New(2)
+
+fmt.Println(sem.IsEmpty()) // true — no slots occupied
+
+sem.Acquire()
+fmt.Println(sem.IsEmpty()) // false — one slot occupied
+
+sem.Release()
+fmt.Println(sem.IsEmpty()) // true — back to idle
+```
+
+The test suite verifies the full acquire/release cycle:
+
+```go
+// from sema_test.go — TestSemaphoreAcquireRelease
+for i := 0; i < 10; i++ {
+    sem.Acquire()
+    sem.Acquire()
+    sem.Acquire()
+
+    sem.Release()
+    sem.Release()
+    sem.Release()
+}
+if !sem.IsEmpty() {
+    t.Error("semaphore should be empty after all releases")
+}
+```
+
+---
+
+## All four methods together
+
+The following example is taken directly from the `sema` test suite. It demonstrates the canonical worker-pool pattern using all four methods.
+
+```go
+// from sema_test.go — TestReadMeExample
+workers := 10
+mySemaphore := sema.New(workers)
+var wg sync.WaitGroup
+var delaySeconds atomic.Int32
+
+for i := 0; i < workers*2; i++ {
+    wg.Add(1)
+    mySemaphore.Acquire() // throttle goroutine launch
+    go func(i int, wg *sync.WaitGroup) {
+        defer wg.Done()
+        defer mySemaphore.Release() // free slot on exit
+        delay := delaySeconds.Add(1)
+        time.Sleep(time.Duration(delay) * time.Second)
+        fmt.Printf("worker %d finished after %d seconds\n", i, delaySeconds.Load())
+    }(i, &wg)
+}
+
+wg.Wait()
+fmt.Printf("workers left in semaphore: %d\n", mySemaphore.Len())
+// mySemaphore.IsEmpty() == true here
+```

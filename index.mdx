@@ -1,97 +1,74 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "sema — Go Semaphore Library"
+description: "A lightweight, zero-dependency Go library for controlling goroutine concurrency with a simple channel-based semaphore."
 ---
 
-## Setting up
+`sema` gives you a minimal, idiomatic Go semaphore to limit how many goroutines run at the same time. It wraps a buffered channel behind a clean interface so you can control parallelism in worker pools, API clients, file processors, and anywhere else you need to bound concurrent work.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install sema and write your first semaphore-guarded goroutine in under a minute.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="API Reference" icon="code" href="/api/semaphore-interface">
+    Full documentation for the Semaphore interface and every method.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Worker Pools" icon="gears" href="/guides/worker-pools">
+    Build bounded worker pools that process jobs concurrently without overloading resources.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Concurrency Patterns" icon="diagram-project" href="/guides/concurrency-patterns">
+    Common patterns for using semaphores alongside sync.WaitGroup and goroutines.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why sema?
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Zero dependencies" icon="circle-check">
+    Uses only the Go standard library — no external packages to manage or audit.
+  </Card>
+  <Card title="Interface-driven" icon="plug">
+    The `Semaphore` interface makes it easy to mock in tests and swap implementations.
+  </Card>
+  <Card title="Safe by default" icon="shield-halved">
+    Edge-case concurrency values (0, negative) are automatically normalized to safe defaults.
+  </Card>
+  <Card title="Introspectable" icon="magnifying-glass">
+    Check live slot usage with `Len()` and `IsEmpty()` without reaching into internals.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started
 
-## Need inspiration?
+<Steps>
+  <Step title="Install the package">
+    Add `sema` to your Go module with a single command:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    ```bash
+    go get -u github.com/andreimerlescu/sema
+    ```
+  </Step>
+  <Step title="Create a semaphore">
+    Call `sema.New` with the maximum number of goroutines you want running at once:
+
+    ```go
+    import "github.com/andreimerlescu/sema"
+
+    sem := sema.New(10) // allow up to 10 concurrent goroutines
+    ```
+  </Step>
+  <Step title="Acquire and release slots">
+    Wrap your goroutine body with `Acquire` before and `Release` (via `defer`) after:
+
+    ```go
+    sem.Acquire()
+    go func() {
+        defer sem.Release()
+        // your work here
+    }()
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  See the [Quickstart](/quickstart) for a complete, runnable example using `sync.WaitGroup` alongside `sema`.
+</Tip>

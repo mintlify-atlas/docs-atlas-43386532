@@ -1,0 +1,148 @@
+---
+title: "Introduction"
+description: "A lightweight, zero-dependency Go semaphore library for bounding goroutine concurrency with a clean, interface-driven API."
+---
+
+`sema` is a Go package that gives you a simple semaphore backed by a buffered channel. Use it any time you need to cap how many goroutines run at once — whether you are processing files in parallel, calling an external API under a rate limit, or running a worker pool against a shared resource.
+
+## What is a semaphore?
+
+A semaphore is a synchronization primitive that controls how many concurrent actors (goroutines, threads, processes) can access a resource or execute a section of code at the same time. Think of it as a fixed supply of tickets: a goroutine must hold a ticket to run, and returns it when it finishes. Once all tickets are taken, new goroutines block until a ticket is freed.
+
+`sema` implements this idea using a buffered channel. Each slot in the channel represents one ticket. Sending to the channel (`Acquire`) claims a ticket; receiving from the channel (`Release`) returns one.
+
+```go
+// Internally, sema creates a buffered channel sized to maxConcurrency.
+// Acquire blocks when the channel is full; Release drains one slot.
+semC := make(chan struct{}, maxConcurrency)
+
+// Acquire
+semC <- struct{}{}
+
+// Release
+<-semC
+```
+
+<Info>
+  Buffered channels in Go are already concurrency-safe, so `sema` needs no
+  additional locking. The channel itself enforces the capacity limit.
+</Info>
+
+## The Semaphore interface
+
+`sema` exposes a single interface with four methods:
+
+```go
+type Semaphore interface {
+    // Acquire takes a slot, blocking until one is available.
+    Acquire()
+
+    // Release frees a slot, unblocking a waiting goroutine.
+    Release()
+
+    // Len returns the number of currently occupied slots.
+    Len() int
+
+    // IsEmpty returns true when no slots are occupied.
+    IsEmpty() bool
+}
+```
+
+Hiding the implementation behind an interface means you can pass a `Semaphore` value through your code, swap it for a test double in unit tests, or replace the backing implementation without changing any call sites.
+
+<Tip>
+  Declare parameters as `sema.Semaphore` rather than the concrete type so your
+  functions remain testable and implementation-agnostic.
+</Tip>
+
+## How it works
+
+`New(maxConcurrency int)` returns a `*semaphore` wrapped as a `Semaphore` interface:
+
+```go
+func New(maxConcurrency int) Semaphore {
+    return &semaphore{
+        semC: make(chan struct{}, safe(maxConcurrency)),
+    }
+}
+```
+
+The `safe` function normalizes edge-case values before the channel is created:
+
+```go
+func safe(maxConcurrency int) int {
+    if maxConcurrency == -1 {
+        maxConcurrency = 333_333
+    }
+    if maxConcurrency < 1 {
+        maxConcurrency = 1
+    }
+    return maxConcurrency
+}
+```
+
+<Note>
+  Passing `0` or any negative number other than `-1` results in a concurrency
+  limit of `1`. Passing exactly `-1` is treated as "effectively unlimited" and
+  sets the limit to `333,333`. These rules prevent you from accidentally
+  creating a zero-capacity channel, which would block every goroutine forever.
+</Note>
+
+| Input value | Effective limit | Reason |
+|-------------|-----------------|--------|
+| `> 0`       | Input value     | Valid; used as-is |
+| `0`         | `1`             | Zero-capacity channel blocks forever |
+| `-1`        | `333,333`       | Sentinel for "no practical limit" |
+| `< -1`      | `1`             | Any other negative normalized to 1 |
+
+## When to use a semaphore
+
+<CardGroup cols={2}>
+  <Card title="Parallel file processing" icon="file-lines">
+    Read or write many files concurrently while keeping disk I/O bounded so you
+    don't exhaust file descriptors.
+  </Card>
+  <Card title="API rate limiting" icon="gauge-high">
+    Cap the number of in-flight HTTP requests to a third-party API that enforces
+    a concurrency or rate limit.
+  </Card>
+  <Card title="Worker pools" icon="gears">
+    Feed a fixed-size pool of goroutines from an unbounded queue of work items
+    without spawning a goroutine per item.
+  </Card>
+  <Card title="Resource protection" icon="shield-halved">
+    Limit concurrent access to a shared resource (database connections, GPU
+    memory, etc.) that can only handle a fixed load.
+  </Card>
+</CardGroup>
+
+## Semaphore vs other synchronization primitives
+
+| Primitive | Use when… |
+|-----------|-----------|
+| `sync.Mutex` | You need mutual exclusion — exactly one goroutine accesses a resource at a time |
+| `sync.RWMutex` | Many goroutines read, but writes must be exclusive |
+| `sync.WaitGroup` | You need to wait for a known set of goroutines to finish, without bounding concurrency |
+| `sema.Semaphore` | You want to allow N goroutines to run concurrently and block the rest |
+| `chan` (unbuffered) | You want a strict one-for-one handoff between a sender and receiver |
+
+<Info>
+  `sema` and `sync.WaitGroup` are complementary: use a semaphore to bound
+  concurrency, and a WaitGroup to wait for all goroutines to finish. The
+  [Quickstart](/quickstart) shows how to combine them.
+</Info>
+
+## Zero external dependencies
+
+`sema` depends only on the Go standard library. The `go.mod` file declares no
+`require` directives:
+
+```text
+module github.com/andreimerlescu/sema
+
+go 1.21
+```
+
+There are no third-party packages to audit, no transitive dependency updates
+to track, and no supply-chain risk beyond the standard library itself. Adding
+`sema` to your module adds exactly one file to your dependency graph.

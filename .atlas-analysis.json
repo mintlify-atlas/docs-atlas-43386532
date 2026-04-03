@@ -1,0 +1,56 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "sema",
+  "projectDescription": "A lightweight Go library providing a simple, channel-based semaphore for controlling goroutine concurrency.",
+  "theme": "luma",
+  "primaryColor": "#00ADD8",
+  "lightColor": "#5DC9E2",
+  "darkColor": "#007D9C",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/concurrency-patterns",
+              "guides/worker-pools",
+              "guides/rate-limiting"
+            ]
+          },
+          {
+            "group": "API Reference",
+            "pages": [
+              "api/semaphore-interface",
+              "api/new",
+              "api/methods"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Channel-based semaphore using Go's built-in concurrency primitives",
+    "Simple Acquire/Release API to control concurrent goroutine slots",
+    "Introspection via Len() and IsEmpty() to observe semaphore state",
+    "Safe handling of edge-case concurrency values (0, -1, etc.)",
+    "Zero external dependencies — only the Go standard library",
+    "Interface-driven design enabling easy mocking and testing"
+  ],
+  "publicApiSurface": [
+    "sema.New(maxConcurrency int) Semaphore",
+    "Semaphore.Acquire()",
+    "Semaphore.Release()",
+    "Semaphore.Len() int",
+    "Semaphore.IsEmpty() bool"
+  ]
+}

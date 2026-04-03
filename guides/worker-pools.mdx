@@ -1,0 +1,337 @@
+---
+title: "Worker pools"
+description: "Build bounded worker pools in Go using sema to process jobs with controlled concurrency."
+---
+
+A worker pool runs a fixed number of goroutines in parallel over a set of jobs. `sema` provides the concurrency bound so you do not need to pre-allocate goroutines or manage channels manually.
+
+## Fixed-size worker pool
+
+The simplest pool processes a slice of jobs, launching one goroutine per job but capping how many run at once.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	const maxWorkers = 5
+
+	jobs := []string{
+		"job-0", "job-1", "job-2", "job-3", "job-4",
+		"job-5", "job-6", "job-7", "job-8", "job-9",
+	}
+
+	sem := sema.New(maxWorkers)
+	var wg sync.WaitGroup
+
+	for _, job := range jobs {
+		wg.Add(1)
+		sem.Acquire() // blocks when maxWorkers goroutines are running
+		go func(j string) {
+			defer wg.Done()
+			defer sem.Release()
+			fmt.Printf("processing %s (active workers: %d)\n", j, sem.Len())
+		}(job)
+	}
+
+	wg.Wait()
+	fmt.Println("all jobs complete")
+}
+```
+
+<Note>
+`Acquire()` is called in the **loop body** before `go func(...)`. This is intentional: the caller blocks until a slot is free, then immediately spawns the goroutine. This keeps memory usage low because goroutines are never created in excess of `maxWorkers`.
+</Note>
+
+## Processing a slice of jobs with bounded concurrency
+
+For real workloads, jobs typically carry structured data. Pass the job value into the goroutine as a parameter to avoid closure capture bugs.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+
+	"github.com/andreimerlescu/sema"
+)
+
+type Job struct {
+	ID      int
+	Payload string
+}
+
+func processJob(job Job) error {
+	// Simulate variable-duration work
+	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+	fmt.Printf("finished job %d: %s\n", job.ID, job.Payload)
+	return nil
+}
+
+func main() {
+	jobs := []Job{
+		{1, "parse-config"},
+		{2, "fetch-data"},
+		{3, "transform"},
+		{4, "validate"},
+		{5, "write-output"},
+		{6, "notify"},
+	}
+
+	sem := sema.New(3) // process at most 3 jobs concurrently
+	var wg sync.WaitGroup
+
+	for _, job := range jobs {
+		wg.Add(1)
+		sem.Acquire()
+		go func(j Job) {
+			defer wg.Done()
+			defer sem.Release()
+			if err := processJob(j); err != nil {
+				fmt.Printf("job %d failed: %v\n", j.ID, err)
+			}
+		}(job)
+	}
+
+	wg.Wait()
+}
+```
+
+<Tip>
+Always pass loop variables as function arguments (e.g., `go func(j Job) { ... }(job)`) rather than capturing them from the enclosing scope. Go's loop variable semantics mean a closure that reads `job` directly will see the last value after the loop completes.
+</Tip>
+
+## Collecting results from concurrent workers
+
+Workers often need to return results. Use either a pre-allocated slice with a mutex or a buffered results channel.
+
+<Tabs>
+  <Tab title="Slice + mutex">
+    ```go main.go
+    package main
+
+    import (
+    	"fmt"
+    	"sync"
+
+    	"github.com/andreimerlescu/sema"
+    )
+
+    func main() {
+    	jobs := []int{1, 2, 3, 4, 5, 6, 7, 8}
+
+    	results := make([]int, len(jobs))
+    	var mu sync.Mutex
+
+    	sem := sema.New(4)
+    	var wg sync.WaitGroup
+
+    	for idx, job := range jobs {
+    		wg.Add(1)
+    		sem.Acquire()
+    		go func(i, j int) {
+    			defer wg.Done()
+    			defer sem.Release()
+
+    			result := j * j // example computation
+
+    			mu.Lock()
+    			results[i] = result
+    			mu.Unlock()
+    		}(idx, job)
+    	}
+
+    	wg.Wait()
+    	fmt.Println("results:", results)
+    }
+    ```
+  </Tab>
+  <Tab title="Results channel">
+    ```go main.go
+    package main
+
+    import (
+    	"fmt"
+    	"sync"
+
+    	"github.com/andreimerlescu/sema"
+    )
+
+    func main() {
+    	jobs := []int{1, 2, 3, 4, 5, 6, 7, 8}
+    	resultsCh := make(chan int, len(jobs)) // buffer so goroutines never block
+
+    	sem := sema.New(4)
+    	var wg sync.WaitGroup
+
+    	for _, job := range jobs {
+    		wg.Add(1)
+    		sem.Acquire()
+    		go func(j int) {
+    			defer wg.Done()
+    			defer sem.Release()
+    			resultsCh <- j * j
+    		}(job)
+    	}
+
+    	wg.Wait()
+    	close(resultsCh)
+
+    	var results []int
+    	for r := range resultsCh {
+    		results = append(results, r)
+    	}
+    	fmt.Println("results:", results)
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+When using a results channel, buffer it to `len(jobs)` so goroutines can send without blocking even if you haven't started reading yet. If the channel is unbuffered and all workers finish before you drain it, goroutines will block on send and `wg.Wait()` will deadlock.
+</Note>
+
+## Waiting for all workers to finish
+
+`sync.WaitGroup` and `sema` each handle a different concern:
+
+- `sema` controls **how many goroutines run concurrently**.
+- `sync.WaitGroup` waits for **all goroutines to complete**.
+
+They work together cleanly:
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	workers := 10
+	mySemaphore := sema.New(workers)
+	var wg sync.WaitGroup
+	var delaySeconds atomic.Int32
+
+	for i := 0; i < workers*2; i++ {
+		wg.Add(1)
+		mySemaphore.Acquire()
+		go func(i int, wg *sync.WaitGroup) {
+			defer wg.Done()
+			defer mySemaphore.Release()
+			delay := delaySeconds.Add(1)
+			time.Sleep(time.Duration(delay) * time.Second)
+			fmt.Printf("worker %d finished after %d seconds\n", i, delaySeconds.Load())
+		}(i, &wg)
+	}
+
+	wg.Wait()
+	fmt.Printf("wait group released with %d workers left in the semaphore\n", mySemaphore.Len())
+
+	if mySemaphore.IsEmpty() {
+		fmt.Println("semaphore is empty — all slots released correctly")
+	}
+}
+```
+
+After `wg.Wait()` returns, calling `IsEmpty()` is a reliable post-condition check that every goroutine released its slot.
+
+## sema-based pools vs. channel-based worker pools
+
+Both approaches bound concurrency, but they have different trade-offs.
+
+<CodeGroup>
+
+```go sema-based pool
+package main
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	jobs := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+
+	sem := sema.New(3)
+	var wg sync.WaitGroup
+
+	// One goroutine per job, bounded by the semaphore.
+	// No pre-allocated worker goroutines needed.
+	for _, job := range jobs {
+		wg.Add(1)
+		sem.Acquire()
+		go func(j int) {
+			defer wg.Done()
+			defer sem.Release()
+			fmt.Printf("sema: processing job %d\n", j)
+		}(job)
+	}
+
+	wg.Wait()
+}
+```
+
+```go channel-based pool
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	jobs := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	jobCh := make(chan int)
+
+	var wg sync.WaitGroup
+
+	// Pre-allocate exactly 3 worker goroutines.
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobCh {
+				fmt.Printf("channel: processing job %d\n", j)
+			}
+		}()
+	}
+
+	for _, job := range jobs {
+		jobCh <- job
+	}
+	close(jobCh)
+
+	wg.Wait()
+}
+```
+
+</CodeGroup>
+
+| | sema-based | channel-based |
+|---|---|---|
+| Worker goroutine count | One per job (bounded by semaphore) | Fixed upfront |
+| Setup complexity | Low — no channel plumbing required | Moderate — requires a job channel |
+| Per-job goroutine overhead | One goroutine allocation per job | Amortised across pre-allocated workers |
+| Collecting results | Channel or mutex | Channel or mutex |
+| Adjusting concurrency limit | Create a new semaphore | Change the worker count before starting |
+
+<Tip>
+The sema-based pattern is well-suited when the number of jobs is known upfront and jobs are heterogeneous (different types, different result shapes). The channel-based pattern shines when workers are long-lived and continuously pull from a stream of work.
+</Tip>

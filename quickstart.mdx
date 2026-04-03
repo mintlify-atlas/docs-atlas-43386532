@@ -1,80 +1,186 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Install sema and run your first semaphore-guarded goroutines in under five minutes."
 ---
 
-## Get started in three steps
+This guide walks you through installing `sema`, running the canonical example from the README, and using `Len` and `IsEmpty` to inspect semaphore state at runtime.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install sema">
+    Add the package to your Go module:
 
-### Step 1: Set up your local environment
+    ```bash
+    go get -u github.com/andreimerlescu/sema
+    ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    `go get` downloads the module, adds it to your `go.mod`, and pins the version in `go.sum`. Because `sema` has no external dependencies, nothing else is added to your module graph.
 
-### Step 2: Deploy your changes
+    <Note>
+      `sema` requires Go 1.21 or later. Run `go version` to check your installed version.
+    </Note>
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Import the package">
+    Add the import path to your Go source file alongside the standard-library packages you'll need:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```go
+    import (
+        "fmt"
+        "sync"
+        "sync/atomic"
+        "time"
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+        "github.com/andreimerlescu/sema"
+    )
+    ```
+  </Step>
 
-### Step 3: Go live
+  <Step title="Run the complete example">
+    The following program is the canonical example from the README, also verified as `TestReadMeExample` in the test suite. Paste it into `main.go` and run it with `go run main.go`.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```go
+    package main
+
+    import (
+        "fmt"
+        "sync"
+        "sync/atomic"
+        "time"
+
+        "github.com/andreimerlescu/sema"
+    )
+
+    func main() {
+        workers := 10 // 10 workers
+        mySemaphore := sema.New(workers)
+        var wg sync.WaitGroup
+        var delaySeconds atomic.Int32
+        for i := 0; i < workers*2; i++ {
+            wg.Add(1)
+            mySemaphore.Acquire()
+            go func(i int, wg *sync.WaitGroup) {
+                defer wg.Done()
+                defer mySemaphore.Release()
+                delay := delaySeconds.Add(1)
+                time.Sleep(time.Duration(delay) * time.Second)
+                fmt.Printf("worker %d finished after %d seconds\n", i, delaySeconds.Load())
+            }(i, &wg)
+        }
+        wg.Wait()
+        fmt.Printf("wait group released with %d workers left in the semaphore\n", mySemaphore.Len())
+    }
+    ```
+
+    The loop schedules `workers*2` (20) goroutines, but only `workers` (10) run at any given time. The remaining 10 block on `Acquire` until a running goroutine calls `Release`.
+  </Step>
+
+  <Step title="Understand each part">
+    Here is what each section of the example does:
+
+    **Create the semaphore**
+
+    ```go
+    workers := 10
+    mySemaphore := sema.New(workers)
+    ```
+
+    `sema.New(10)` allocates a buffered channel with capacity 10. At most 10 goroutines can hold a slot at the same time.
+
+    **Acquire before spawning the goroutine**
+
+    ```go
+    mySemaphore.Acquire()
+    go func(i int, wg *sync.WaitGroup) { ... }(i, &wg)
+    ```
+
+    `Acquire` is called on the main goroutine, *before* `go func`. This is intentional: the slot is claimed synchronously, so the loop itself blocks when all 10 slots are taken. No goroutine is ever spawned without a slot already reserved — preventing unbounded goroutine creation.
+
+    <Tip>
+      Always call `Acquire` before `go func`, not inside it. Calling it inside
+      the goroutine still bounds concurrent work, but lets all goroutines be
+      spawned first, which consumes memory proportional to the total number of
+      items before any throttling takes effect.
+    </Tip>
+
+    **Release via defer**
+
+    ```go
+    defer wg.Done()
+    defer mySemaphore.Release()
+    ```
+
+    Both defers fire when the goroutine returns, even if it panics. `defer` ensures `Release` is never skipped, avoiding a deadlock where the semaphore fills up and no one ever drains it.
+
+    <Note>
+      `defer` statements execute in LIFO order. Here `wg.Done()` is deferred
+      first and `mySemaphore.Release()` second, so `Release` runs before
+      `wg.Done()`. This means the semaphore slot is freed before the WaitGroup
+      counter decrements — which is safe and correct.
+    </Note>
+
+    **Wait for all goroutines to finish**
+
+    ```go
+    wg.Wait()
+    ```
+
+    `sync.WaitGroup` tracks outstanding goroutines. `wg.Add(1)` increments the counter before each goroutine starts; `defer wg.Done()` decrements it when the goroutine returns. `wg.Wait()` blocks the main goroutine until the counter reaches zero.
+
+    `sema` and `sync.WaitGroup` serve different purposes:
+
+    | | `sema.Semaphore` | `sync.WaitGroup` |
+    |--|--|--|
+    | **Purpose** | Limit concurrent goroutines | Wait for all goroutines to finish |
+    | **Blocks when** | Capacity is full | Counter is non-zero |
+    | **Releases when** | `Release()` is called | `Done()` is called |
+  </Step>
+
+  <Step title="Inspect semaphore state">
+    Use `Len` and `IsEmpty` to observe how many slots are occupied at any point:
+
+    ```go
+    sem := sema.New(3)
+
+    sem.Acquire()
+    fmt.Println(sem.Len())     // 1
+    fmt.Println(sem.IsEmpty()) // false
+
+    sem.Acquire()
+    fmt.Println(sem.Len())     // 2
+
+    sem.Release()
+    sem.Release()
+    fmt.Println(sem.IsEmpty()) // true
+    ```
+
+    After `wg.Wait()` returns in the full example, all goroutines have finished and released their slots, so `mySemaphore.Len()` returns `0` and `mySemaphore.IsEmpty()` returns `true`.
+
+    ```go
+    wg.Wait()
+    fmt.Printf("wait group released with %d workers left in the semaphore\n", mySemaphore.Len())
+    // Output: wait group released with 0 workers left in the semaphore
+    ```
+
+    <Info>
+      `Len()` reads `len(channel)`, which is an O(1) operation in Go and safe
+      to call from any goroutine at any time.
+    </Info>
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Concurrency patterns" icon="diagram-project" href="/guides/concurrency-patterns">
+    Common patterns for combining semaphores with WaitGroups, contexts, and error groups.
+  </Card>
+  <Card title="Worker pools" icon="gears" href="/guides/worker-pools">
+    Build a bounded worker pool that processes a queue of jobs without spawning one goroutine per item.
+  </Card>
+  <Card title="Rate limiting" icon="gauge-high" href="/guides/rate-limiting">
+    Use a semaphore to cap the number of concurrent outbound HTTP requests.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/semaphore-interface">
+    Full documentation for every method on the Semaphore interface.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

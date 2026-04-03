@@ -1,0 +1,279 @@
+---
+title: "Rate limiting"
+description: "Throttle concurrent HTTP requests, file I/O, and database operations using sema."
+---
+
+A semaphore is an effective token-bucket style rate limiter for I/O-bound work: it caps the number of in-flight operations at any moment, protecting downstream resources from being overwhelmed.
+
+## Limiting concurrent HTTP requests
+
+Without a concurrency limit, firing hundreds of HTTP requests at once can exhaust file descriptors, trigger server-side rate limits, or saturate the local network stack. `sema` lets you cap simultaneous requests to a safe number.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func fetchURL(sem sema.Semaphore, wg *sync.WaitGroup, url string) {
+	defer wg.Done()
+	defer sem.Release()
+
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil {
+		fmt.Printf("error fetching %s: %v\n", url, err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Printf("fetched %s — status %d\n", url, resp.StatusCode)
+}
+
+func main() {
+	urls := []string{
+		"https://example.com",
+		"https://example.org",
+		"https://example.net",
+		// ... more URLs
+	}
+
+	const maxConcurrent = 5 // at most 5 in-flight HTTP requests
+	sem := sema.New(maxConcurrent)
+	var wg sync.WaitGroup
+
+	for _, url := range urls {
+		wg.Add(1)
+		sem.Acquire() // blocks when 5 requests are already in flight
+		go fetchURL(sem, &wg, url)
+	}
+
+	wg.Wait()
+	fmt.Printf("all requests complete, semaphore empty: %v\n", sem.IsEmpty())
+}
+```
+
+<Warning>
+Using `http.Get` without a context means requests have no timeout. In production, use `http.NewRequestWithContext` with a `context.WithTimeout` so stalled connections do not hold semaphore slots indefinitely.
+</Warning>
+
+## Throttling file I/O operations
+
+Reading or writing many files concurrently exhausts file descriptors and can degrade performance due to OS scheduler contention. Cap concurrent file operations to a fraction of the system's `ulimit -n` value.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func processFile(sem sema.Semaphore, wg *sync.WaitGroup, path string) {
+	defer wg.Done()
+	defer sem.Release()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Printf("error reading %s: %v\n", path, err)
+		return
+	}
+	fmt.Printf("read %s: %d bytes\n", path, len(data))
+}
+
+func main() {
+	files := []string{
+		"/etc/hostname",
+		"/etc/os-release",
+		"/etc/passwd",
+		// ... more paths
+	}
+
+	const maxOpenFiles = 8 // stay well below the system ulimit
+	sem := sema.New(maxOpenFiles)
+	var wg sync.WaitGroup
+
+	for _, path := range files {
+		wg.Add(1)
+		sem.Acquire()
+		go processFile(sem, &wg, path)
+	}
+
+	wg.Wait()
+	fmt.Println("all files processed")
+}
+```
+
+<Tip>
+A common rule of thumb is to cap concurrent file operations at 25–50% of `ulimit -n` (typically 1024 on Linux). This leaves headroom for your process's own file descriptors (logs, sockets, etc.).
+</Tip>
+
+## Controlling database connection concurrency
+
+Even with a connection pool, sending too many concurrent queries can exhaust pool connections and cause timeouts. Use `sema` as a lightweight admission gate in front of your database calls.
+
+```go main.go
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"sync"
+
+	_ "github.com/lib/pq" // example: PostgreSQL driver
+	"github.com/andreimerlescu/sema"
+)
+
+type UserRecord struct {
+	ID   int
+	Name string
+}
+
+func fetchUser(sem sema.Semaphore, wg *sync.WaitGroup, db *sql.DB, userID int) {
+	defer wg.Done()
+	defer sem.Release()
+
+	var u UserRecord
+	err := db.QueryRow("SELECT id, name FROM users WHERE id = $1", userID).Scan(&u.ID, &u.Name)
+	if err != nil {
+		fmt.Printf("error fetching user %d: %v\n", userID, err)
+		return
+	}
+	fmt.Printf("fetched user %d: %s\n", u.ID, u.Name)
+}
+
+func main() {
+	db, err := sql.Open("postgres", "postgres://localhost/mydb?sslmode=disable")
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+
+	// Match semaphore size to the connection pool size so queries
+	// never wait for a pool connection after acquiring a slot.
+	db.SetMaxOpenConns(10)
+	sem := sema.New(10)
+
+	userIDs := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+
+	var wg sync.WaitGroup
+	for _, id := range userIDs {
+		wg.Add(1)
+		sem.Acquire()
+		go fetchUser(sem, &wg, db, id)
+	}
+
+	wg.Wait()
+	fmt.Println("all queries complete")
+}
+```
+
+<Info>
+Set `db.SetMaxOpenConns(N)` and `sema.New(N)` to the same value. If the semaphore is larger than the pool, goroutines that acquire a slot may still block waiting for a connection, holding the slot idle and reducing effective throughput.
+</Info>
+
+## Using IsEmpty() to know when all work is done
+
+`IsEmpty()` returns `true` when every acquired slot has been released, meaning no goroutines are still running. After `wg.Wait()`, you can use it as a correctness check.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	sem := sema.New(4)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		sem.Acquire()
+		go func(id int) {
+			defer wg.Done()
+			defer sem.Release()
+			time.Sleep(50 * time.Millisecond)
+			fmt.Printf("task %d done\n", id)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Post-condition: all slots must be released.
+	if !sem.IsEmpty() {
+		panic(fmt.Sprintf("semaphore leak: %d slots still held", sem.Len()))
+	}
+	fmt.Println("clean shutdown confirmed")
+}
+```
+
+You can also poll `IsEmpty()` in a background goroutine to emit metrics:
+
+```go metrics.go
+go func() {
+    for {
+        time.Sleep(500 * time.Millisecond)
+        fmt.Printf("active workers: %d\n", sem.Len())
+        if sem.IsEmpty() {
+            return
+        }
+    }
+}()
+```
+
+<Warning>
+Do not use `IsEmpty()` as a synchronisation mechanism. Always use `wg.Wait()` to block until all goroutines finish. `IsEmpty()` is an observability tool, not a barrier.
+</Warning>
+
+## Choosing the right maxConcurrency value
+
+There is no universal answer. The right value depends on the nature of your workload and the resource you are protecting.
+
+<Steps>
+  <Step title="Identify the bottleneck resource">
+    Determine what you are protecting: CPU cores, open file descriptors, HTTP connections, or database connections. The semaphore size should not exceed the capacity of that resource.
+  </Step>
+  <Step title="Start conservatively">
+    Begin with a low value (e.g., `4`–`8` for I/O-bound work) and measure latency and error rates before increasing. It is easier to raise a limit than to recover from a resource exhaustion incident.
+  </Step>
+  <Step title="Match pool sizes">
+    For database or HTTP client pools, set `maxConcurrency` equal to or less than the pool's `MaxOpenConns` / `MaxIdleConns`. Exceeding the pool size wastes goroutines waiting for a connection.
+  </Step>
+  <Step title="Profile under load">
+    Run benchmarks or load tests with realistic traffic. Use `sem.Len()` metrics to check how often the semaphore is saturated. If `Len()` is always at maximum, increase the limit. If it is rarely above 1, decrease it.
+  </Step>
+</Steps>
+
+### Reference values by workload type
+
+| Workload | Typical starting value | Reasoning |
+|---|---|---|
+| CPU-bound computation | `runtime.NumCPU()` | One goroutine per core avoids context-switching overhead |
+| Outbound HTTP requests | `10`–`50` | Balances throughput against server-side rate limits |
+| File I/O | `8`–`32` | Stays below typical `ulimit -n` headroom |
+| Database queries | Equal to pool `MaxOpenConns` | Prevents goroutines from queuing behind connection pool waits |
+| Unlimited (use with care) | `-1` (clamped to `333,333`) | Effectively unbounded; only use when the downstream system has no meaningful limit |
+
+```go
+// CPU-bound
+import "runtime"
+sem := sema.New(runtime.NumCPU())
+
+// I/O-bound with a known pool limit
+const dbPoolSize = 20
+sem := sema.New(dbPoolSize)
+
+// Effectively unlimited (avoid unless you know what you are doing)
+sem := sema.New(-1)
+```

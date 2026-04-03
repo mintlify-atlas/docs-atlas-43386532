@@ -1,0 +1,89 @@
+---
+title: "New"
+description: "Constructor that creates and returns a concurrency-limited Semaphore."
+---
+
+## Function signature
+
+```go
+func New(maxConcurrency int) Semaphore
+```
+
+`New` is the only constructor in the `sema` package. It allocates a buffered channel of size `maxConcurrency` and returns it wrapped in a `Semaphore` interface value.
+
+## Parameter
+
+<ParamField path="maxConcurrency" type="int" required>
+  The maximum number of goroutines (or tasks) that may hold a slot simultaneously.
+
+  | Value | Behaviour |
+  |-------|-----------|
+  | Positive integer (e.g. `10`) | Used as-is for the channel buffer size. |
+  | `-1` | Treated as `333,333` — a high-but-bounded default for near-unlimited concurrency. |
+  | `0` or any other negative value | Clamped to `1`, preventing a zero-capacity channel that would block every caller. |
+
+  These edge cases are handled by the internal `safe()` function before the channel is created. You never need to call `safe()` directly.
+</ParamField>
+
+## Return value
+
+<ResponseField name="Semaphore" type="Semaphore">
+  A `Semaphore` interface value backed by a `*semaphore` struct. The concrete
+  type is unexported; interact with it exclusively through the interface
+  methods: `Acquire`, `Release`, `Len`, and `IsEmpty`.
+</ResponseField>
+
+## How it works
+
+Internally, `New` calls the package-private `safe()` function to normalise `maxConcurrency`, then creates a buffered channel of that size:
+
+```go
+func New(maxConcurrency int) Semaphore {
+    return &semaphore{
+        semC: make(chan struct{}, safe(maxConcurrency)),
+    }
+}
+```
+
+Each call to `Acquire` sends one `struct{}{}` into the channel, and each call to `Release` receives one value out. When the channel is full, `Acquire` blocks until another goroutine calls `Release`.
+
+## Examples
+
+<CodeGroup>
+
+```go basic usage
+package main
+
+import "github.com/andreimerlescu/sema"
+
+func main() {
+    sem := sema.New(10) // allow up to 10 concurrent goroutines
+    _ = sem
+}
+```
+
+```go edge cases
+package main
+
+import "github.com/andreimerlescu/sema"
+
+func main() {
+    semA := sema.New(-1) // capacity → 333,333
+    semB := sema.New(0)  // capacity → 1
+    semC := sema.New(-5) // capacity → 1
+    _, _, _ = semA, semB, semC
+}
+```
+
+</CodeGroup>
+
+<Tip>
+  Pass `sema.New(runtime.NumCPU())` to limit concurrency to the number of
+  logical CPUs available on the current machine.
+</Tip>
+
+<Warning>
+  Passing `0` does **not** create an unbounded semaphore — it creates one with
+  a capacity of `1`, making it effectively a mutex. Use `-1` if you want a
+  very high default ceiling instead.
+</Warning>

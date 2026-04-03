@@ -1,0 +1,291 @@
+---
+title: "Concurrency patterns"
+description: "Common patterns for controlling concurrency in Go using the sema semaphore library."
+---
+
+The `sema` library provides a minimal semaphore that lets you cap how many goroutines run at once. This page shows the fundamental patterns you will reach for most often.
+
+## Installation
+
+```bash
+go get -u github.com/andreimerlescu/sema
+```
+
+## Pattern 1: Basic acquire and release
+
+Call `Acquire()` before starting work and `Release()` when finished. `Acquire()` blocks until a slot is available, so at most `maxConcurrency` goroutines hold the semaphore at the same time.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	sem := sema.New(3) // allow at most 3 concurrent goroutines
+	var wg sync.WaitGroup
+
+	for i := 0; i < 9; i++ {
+		wg.Add(1)
+		sem.Acquire()
+		go func(id int) {
+			defer wg.Done()
+			defer sem.Release()
+			fmt.Printf("worker %d running\n", id)
+		}(i)
+	}
+
+	wg.Wait()
+}
+```
+
+<Note>
+`Acquire()` is called **before** spawning the goroutine. This ensures the semaphore slot is held before the goroutine starts, so the caller is the one that blocks — not an already-running goroutine inside the pool.
+</Note>
+
+## Pattern 2: Using defer for safe release
+
+Always pair `Acquire()` with a deferred `Release()`. If a goroutine panics, `defer` guarantees the slot is returned, preventing the semaphore from deadlocking.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func processItem(sem sema.Semaphore, wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+	defer sem.Release() // always runs, even on panic
+
+	fmt.Printf("processing item %d\n", id)
+}
+
+func main() {
+	sem := sema.New(5)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		sem.Acquire()
+		go processItem(sem, &wg, i)
+	}
+
+	wg.Wait()
+}
+```
+
+<Warning>
+Never call `Release()` without a preceding `Acquire()`. Releasing more slots than you acquired attempts to receive from an empty channel, which will block the calling goroutine indefinitely.
+</Warning>
+
+## Pattern 3: Combining sema with sync.WaitGroup
+
+This is the canonical pattern from the README and `TestReadMeExample`. Use `sync.WaitGroup` to block the caller until all goroutines finish, and `sema` to cap how many run concurrently.
+
+<Steps>
+  <Step title="Create the semaphore and WaitGroup">
+    ```go
+    workers := 10
+    mySemaphore := sema.New(workers)
+    var wg sync.WaitGroup
+    ```
+  </Step>
+  <Step title="Acquire before launching each goroutine">
+    ```go
+    for i := 0; i < workers*2; i++ {
+        wg.Add(1)
+        mySemaphore.Acquire() // blocks when 10 goroutines are already active
+        go func(i int) {
+            defer wg.Done()
+            defer mySemaphore.Release()
+            // do work here
+        }(i)
+    }
+    ```
+  </Step>
+  <Step title="Wait for all goroutines to finish">
+    ```go
+    wg.Wait()
+    fmt.Printf("done, slots remaining in semaphore: %d\n", mySemaphore.Len())
+    ```
+  </Step>
+</Steps>
+
+Complete runnable example (taken directly from `TestReadMeExample`):
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	workers := 10
+	mySemaphore := sema.New(workers)
+	var wg sync.WaitGroup
+	var delaySeconds atomic.Int32
+
+	for i := 0; i < workers*2; i++ {
+		wg.Add(1)
+		mySemaphore.Acquire()
+		go func(i int, wg *sync.WaitGroup) {
+			defer wg.Done()
+			defer mySemaphore.Release()
+			delay := delaySeconds.Add(1)
+			time.Sleep(time.Duration(delay) * time.Second)
+			fmt.Printf("worker %d finished after %d seconds\n", i, delaySeconds.Load())
+		}(i, &wg)
+	}
+
+	wg.Wait()
+	fmt.Printf("wait group released with %d workers left in the semaphore\n", mySemaphore.Len())
+}
+```
+
+Although 20 goroutines are scheduled (`workers*2`), only 10 run at a time. The loop blocks on `Acquire()` until a slot frees up.
+
+## Pattern 4: Checking occupancy with Len() and IsEmpty()
+
+`Len()` returns the number of currently occupied slots. `IsEmpty()` returns `true` when no goroutines hold the semaphore.
+
+<Tabs>
+  <Tab title="Len()">
+    ```go
+    sem := sema.New(5)
+
+    sem.Acquire()
+    sem.Acquire()
+
+    fmt.Println(sem.Len()) // 2 — two slots are occupied
+
+    sem.Release()
+    fmt.Println(sem.Len()) // 1
+    ```
+  </Tab>
+  <Tab title="IsEmpty()">
+    ```go
+    sem := sema.New(5)
+
+    fmt.Println(sem.IsEmpty()) // true — nothing acquired yet
+
+    sem.Acquire()
+    fmt.Println(sem.IsEmpty()) // false
+
+    sem.Release()
+    fmt.Println(sem.IsEmpty()) // true — back to idle
+    ```
+  </Tab>
+</Tabs>
+
+A practical use case is logging or monitoring how saturated your semaphore is:
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func main() {
+	sem := sema.New(4)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		sem.Acquire()
+		go func(id int) {
+			defer wg.Done()
+			defer sem.Release()
+			fmt.Printf("worker %d started (semaphore occupancy: %d)\n", id, sem.Len())
+			time.Sleep(100 * time.Millisecond)
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Printf("all done, semaphore empty: %v\n", sem.IsEmpty())
+}
+```
+
+<Tip>
+Use `IsEmpty()` as a post-condition check in tests to verify that all goroutines released their slots correctly. `TestSemaphoreAcquireRelease` and `TestReadMeExample` both demonstrate this pattern.
+</Tip>
+
+## Pattern 5: Dynamic concurrency with a new semaphore
+
+`sema.Semaphore` has a fixed capacity set at creation time. To change the concurrency limit at runtime, drain the current semaphore and replace it with a new one.
+
+```go main.go
+package main
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/andreimerlescu/sema"
+)
+
+func runBatch(sem sema.Semaphore, jobs []int) {
+	var wg sync.WaitGroup
+	for _, job := range jobs {
+		wg.Add(1)
+		sem.Acquire()
+		go func(j int) {
+			defer wg.Done()
+			defer sem.Release()
+			fmt.Printf("processing job %d\n", j)
+		}(job)
+	}
+	wg.Wait()
+}
+
+func main() {
+	jobs := make([]int, 30)
+	for i := range jobs {
+		jobs[i] = i
+	}
+
+	// First batch: low concurrency
+	fmt.Println("running with concurrency=3")
+	runBatch(sema.New(3), jobs[:15])
+
+	// Second batch: higher concurrency after reconfiguration
+	fmt.Println("running with concurrency=10")
+	runBatch(sema.New(10), jobs[15:])
+}
+```
+
+<Note>
+Because `sema.New` returns a `sema.Semaphore` interface, you can swap semaphore instances freely. Functions that accept a `sema.Semaphore` parameter work with any capacity without code changes.
+</Note>
+
+## Special values for maxConcurrency
+
+| Value | Behaviour |
+|-------|-----------|
+| `1`   | Fully serialised — only one goroutine at a time |
+| `N`   | At most N goroutines concurrently |
+| `-1`  | Treated as `333,333` — effectively unlimited |
+| `0` or negative (other than `-1`) | Clamped to `1` |
+
+```go
+sem := sema.New(-1) // up to 333,333 concurrent goroutines
+sem := sema.New(1)  // serialised execution
+```
